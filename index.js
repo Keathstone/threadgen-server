@@ -1,4 +1,6 @@
-// ThreadGen backend — FAL image-edit proxy for AI clothing campaign generation
+// ThreadGen backend — AI clothing campaign generator.
+// Pipeline: generate brand model -> FASHN try-on (pixel-accurate garment) ->
+// scene/background -> forced upscale. Plus brand-model save + logo-lock compositing.
 // One Express file. Holds FAL_KEY. Frontend (GitHub Pages) calls these routes.
 
 const express = require('express');
@@ -17,18 +19,37 @@ function loadEnv() {
       const i = t.indexOf('=');
       const k = t.slice(0, i).trim();
       const v = t.slice(i + 1).trim();
-      if (!process.env[k]) process.env[k] = v;
+      process.env[k] = v; // last one wins (matches dotenv behaviour)
     }
   }
 }
 loadEnv();
 
 const FAL_KEY = process.env.FAL_KEY;
-const FAL_EDIT = 'https://fal.run/fal-ai/gemini-25-flash-image/edit';
-const FAL_UPSCALE = 'https://fal.run/fal-ai/clarity-upscaler';
+
+// ---- FAL endpoints ----
+const FAL_GEN     = 'https://fal.run/fal-ai/flux/dev';                     // text -> image (brand model, real skin)
+const FAL_GEN_ALT = 'https://fal.run/fal-ai/gemini-25-flash-image';        // fallback generator
+const FAL_EDIT    = 'https://fal.run/fal-ai/gemini-25-flash-image/edit';   // image edit (scene / background)
+const FAL_TRYON   = 'https://fal.run/fal-ai/fashn/tryon/v1.6';             // garment try-on (pixel-accurate)
+const FAL_UPSCALE = 'https://fal.run/fal-ai/clarity-upscaler';            // detail + real texture
 
 const app = express();
-app.use(cors()); // open during eval; lock to GH Pages origin for production
+
+// ---- CORS: lock to GitHub Pages origin (+ localhost for dev) ----
+const ALLOWED = [
+  'https://keathstone.github.io',
+  'http://localhost:3001',
+  'http://127.0.0.1:3001',
+  'http://localhost:5173',
+];
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);            // curl / same-origin / native app
+    if (ALLOWED.includes(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+}));
 app.use(express.json({ limit: '25mb' }));
 
 const upload = multer({ dest: '/tmp/threadgen_uploads/' });
@@ -44,85 +65,150 @@ const STYLES = {
   studio:     'professional photography studio, seamless backdrop, soft-box lighting, polished e-commerce look',
 };
 
-// Quality base baked under everything (real texture + semi-iphone). Validated.
+// ---- background / scene presets for the swap step ----
+const SCENES = {
+  street:  'a real city street, urban sidewalk with shopfronts and concrete, natural daylight',
+  studio:  'a clean professional photo studio with a seamless neutral backdrop and soft-box lighting',
+  beach:   'a sunny beach with sand and ocean behind, warm golden natural light',
+  rooftop: 'an urban rooftop at golden hour, city skyline behind, warm directional light',
+  park:    'a green park with trees and natural daylight, soft background blur',
+  indoor:  'a stylish modern interior with warm ambient light and tasteful decor',
+};
+
+// Quality base baked under everything (real texture, beats the plastic AI look)
 const QUALITY_BASE =
   'CRITICAL: highly realistic facial skin texture with visible pores, fine lines and natural imperfections, ' +
   'real human skin, NOT smooth, NOT airbrushed, NOT plastic or CGI. Semi-iPhone photo quality, soft natural ' +
   'light, slight real-camera grain, looks like an actual photograph not a render. ';
 
-const PRODUCT_LOCK =
-  'Keep the clothing item design, fit, colors and any logo identical to the product reference image. ';
-
-// Build the full prompt from the structured inputs the frontend sends
-function buildPrompt({ styles = [], pose = '', edits = '', refsCopy = [], campaignVision = '', shot = '' }) {
-  let p = 'A photo of a person wearing exactly this clothing item from the product reference image. ';
-  p += QUALITY_BASE + PRODUCT_LOCK;
-
-  const styleText = styles.map(s => STYLES[s]).filter(Boolean).join('; ');
-  if (styleText) p += `STYLE: ${styleText}. `;
-  if (pose) p += `POSE: ${pose}. `;
-  if (refsCopy.length) p += `From the additional reference image(s), copy the ${refsCopy.join(', ')}. `;
-  if (campaignVision) p += `CAMPAIGN VISION: ${campaignVision}. `;
-  if (shot) p += `SHOT: ${shot}, consistent with the campaign theme. `;
-  if (edits) p += `ADDITIONAL EDITS: ${edits}. `;
-  return p;
+// Build a brand-model description from the picker (gender/build/ethnicity/age)
+function modelDescription(m = {}) {
+  const gender    = m.gender    || 'person';
+  const build     = m.build     ? `${m.build} build` : 'average build';
+  const ethnicity = m.ethnicity ? `${m.ethnicity} ` : '';
+  const age       = m.age       || 'young adult';
+  return `a ${age} ${ethnicity}${gender} with ${build}`;
 }
 
-async function falEdit(prompt, imageUrls, numImages = 1) {
-  const r = await fetch(FAL_EDIT, {
+// ---- low-level FAL callers ----
+async function falPost(url, body) {
+  const r = await fetch(url, {
     method: 'POST',
     headers: { Authorization: `Key ${FAL_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, image_urls: imageUrls, num_images: numImages }),
+    body: JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`FAL edit ${r.status}: ${(await r.text()).slice(0, 300)}`);
-  const j = await r.json();
-  return (j.images || []).map(i => i.url);
+  if (!r.ok) throw new Error(`FAL ${url.split('/').slice(-2).join('/')} ${r.status}: ${(await r.text()).slice(0, 300)}`);
+  return r.json();
 }
 
-async function falUpscale(imageUrl) {
-  const r = await fetch(FAL_UPSCALE, {
-    method: 'POST',
-    headers: { Authorization: `Key ${FAL_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image_url: imageUrl, scale_factor: 2.0, creativity: 0.2, resemblance: 0.9 }),
-  });
-  if (!r.ok) return imageUrl; // upscale is a bonus; fall back to original
-  const j = await r.json();
-  return (j.image && j.image.url) || ((j.images || [])[0] || {}).url || imageUrl;
+async function genModel(prompt, seed) {
+  // FLUX dev renders grittier, realistic skin (beats Gemini's plastic faces).
+  // Portrait 3:4, real-photo framing. Falls back to Gemini if FLUX hiccups.
+  const realPrefix = 'Candid real photograph, shot on a full-frame camera, 50mm lens, natural lighting, ' +
+    'authentic editorial fashion photo. ';
+  try {
+    const j = await falPost(FAL_GEN, {
+      prompt: realPrefix + prompt,
+      image_size: 'portrait_4_3',
+      num_images: 1,
+      guidance_scale: 3.5,
+      num_inference_steps: 30,
+      enable_safety_checker: true,
+      ...(seed != null ? { seed } : {}),
+    });
+    const u = (j.images || [])[0]?.url;
+    if (u) return u;
+  } catch (e) { /* fall through to alt */ }
+  const j = await falPost(FAL_GEN_ALT, { prompt, aspect_ratio: '3:4', num_images: 1, ...(seed != null ? { seed } : {}) });
+  return (j.images || [])[0]?.url;
 }
 
-// Upload a local file to FAL storage, return a hosted URL the edit model can read
-async function uploadToFal(filePath, mime) {
-  const buf = fs.readFileSync(filePath);
-  // FAL accepts data URIs in image_urls, simplest + no extra storage call
-  return `data:${mime};base64,${buf.toString('base64')}`;
+async function tryOn(modelUrl, garmentUrl, category = 'auto') {
+  const j = await falPost(FAL_TRYON, {
+    model_image: modelUrl,
+    garment_image: garmentUrl,
+    category,
+    garment_photo_type: 'auto',
+    mode: 'quality',
+    output_format: 'png',
+  });
+  return (j.images || [])[0]?.url;
+}
+
+async function editScene(prompt, imageUrls) {
+  const j = await falPost(FAL_EDIT, { prompt, image_urls: imageUrls, num_images: 1 });
+  return (j.images || [])[0]?.url;
+}
+
+async function upscale(imageUrl) {
+  try {
+    // Higher creativity + a texture prompt makes the upscaler ADD real skin detail and
+    // photographic grain instead of just sharpening the plastic look. This is the
+    // final pass on every image, so it's what kills the airbrushed AI face.
+    const j = await falPost(FAL_UPSCALE, {
+      image_url: imageUrl,
+      scale_factor: 2.0,
+      creativity: 0.4,
+      resemblance: 0.75,
+      prompt: 'realistic human skin with visible pores and fine texture, natural photographic film grain, ' +
+        'sharp real-camera detail, not smooth, not airbrushed, not plastic',
+    });
+    return (j.image && j.image.url) || ((j.images || [])[0] || {}).url || imageUrl;
+  } catch { return imageUrl; } // upscale is a bonus; never fail the request over it
+}
+
+// data-URI a local upload so FAL can read it without a storage round-trip
+function toDataUri(filePath, mime) {
+  return `data:${mime};base64,${fs.readFileSync(filePath).toString('base64')}`;
 }
 
 // ---- health ----
-app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'tryon-v2' }));
+app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES), scenes: Object.keys(SCENES) }));
 
-// ---- list styles (frontend builds chips from this) ----
-app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES) }));
-
-// ---- TEST photo: product + optional refs -> 1 image ----
-app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 1 }, { name: 'refs', maxCount: 4 }]), async (req, res) => {
+// ---- TEST shot: product mockup + model options -> ONE pixel-accurate try-on shot ----
+// Flow (v3): generate brand model ALREADY in the desired scene/style (or reuse saved)
+//   -> FASHN try-on garment LAST so the logo is never re-rendered -> upscale w/ texture.
+// We deliberately do NOT run a post try-on edit pass, because that re-draws the garment
+// and destroys the logo + re-smooths skin. Scene/style live in the model prompt instead.
+app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 1 }, { name: 'modelImg', maxCount: 1 }]), async (req, res) => {
   const files = [];
   try {
     if (!req.files || !req.files.product) return res.status(400).json({ error: 'product image required' });
     const opts = JSON.parse(req.body.options || '{}');
 
-    const productUrl = await uploadToFal(req.files.product[0].path, req.files.product[0].mimetype);
+    const garmentUrl = toDataUri(req.files.product[0].path, req.files.product[0].mimetype);
     files.push(req.files.product[0].path);
-    const imageUrls = [productUrl];
 
-    if (req.files.refs) {
-      for (const f of req.files.refs) {
-        imageUrls.push(await uploadToFal(f.path, f.mimetype));
-        files.push(f.path);
-      }
+    const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
+    const styleText = (opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; ');
+
+    // 1) brand model: reuse a saved model image if provided, else generate it
+    //    ALREADY standing in the right scene/style (so no destructive edit later)
+    let modelUrl;
+    if (req.files.modelImg) {
+      modelUrl = toDataUri(req.files.modelImg[0].path, req.files.modelImg[0].mimetype);
+      files.push(req.files.modelImg[0].path);
+    } else {
+      const pose = opts.pose ? opts.pose : 'natural relaxed standing pose';
+      let prompt = `Full-body photo of ${modelDescription(opts.model)}, ${pose}, wearing plain neutral fitted clothing. `;
+      if (sceneText) prompt += `Setting: ${sceneText}. `;
+      else prompt += 'Setting: clean light-grey studio backdrop, even lighting. ';
+      if (styleText) prompt += `STYLE: ${styleText}. `;
+      if (opts.edits) prompt += `Scene details: ${opts.edits}. `;
+      prompt += QUALITY_BASE;
+      modelUrl = await genModel(prompt, opts.model && opts.model.seed);
+      if (!modelUrl) throw new Error('model generation failed');
     }
-    const prompt = buildPrompt(opts);
-    const urls = await falEdit(prompt, imageUrls, 1);
-    res.json({ success: true, image: urls[0], prompt });
+
+    // 2) try-on LAST: warp the ACTUAL garment pixels onto the model (logo/text stay exact)
+    let url = await tryOn(modelUrl, garmentUrl, opts.category || 'auto');
+    if (!url) throw new Error('try-on failed');
+
+    // 3) forced upscale on every output -> real texture, breaks the plastic look
+    url = await upscale(url);
+
+    res.json({ success: true, image: url, modelImage: modelUrl.startsWith('data:') ? null : modelUrl });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   } finally {
@@ -130,7 +216,7 @@ app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 1 }, { n
   }
 });
 
-// ---- CAMPAIGN: approved test photo (anchor) + product -> 5 themed shots ----
+// ---- CAMPAIGN: approved anchor + product -> 5 themed shots, same model+garment ----
 app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 1 }, { name: 'approved', maxCount: 1 }]), async (req, res) => {
   const files = [];
   try {
@@ -138,14 +224,11 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 1 }, { nam
       return res.status(400).json({ error: 'product and approved test image required' });
     const opts = JSON.parse(req.body.options || '{}');
 
-    const approvedUrl = await uploadToFal(req.files.approved[0].path, req.files.approved[0].mimetype);
-    const productUrl = await uploadToFal(req.files.product[0].path, req.files.product[0].mimetype);
-    files.push(req.files.product[0].path, req.files.approved[0].path);
+    const approvedUrl = toDataUri(req.files.approved[0].path, req.files.approved[0].mimetype);
+    files.push(req.files.approved[0].path, req.files.product[0].path);
 
-    const anchor =
-      'Use the SAME exact person from the FIRST reference image (same face, features, skin tone, hairstyle) ' +
-      'and the SAME clothing item from the second reference (identical design and logo). Identity stays ' +
-      'consistent across the shot. ' + QUALITY_BASE;
+    const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
+    const styleText = (opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; ');
 
     const shots = [
       'wide full-body shot',
@@ -157,15 +240,15 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 1 }, { nam
 
     const out = [];
     for (const shot of shots) {
-      let p = anchor;
-      const styleText = (opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; ');
+      let p = 'Use the SAME exact person (same face, skin tone, hair) and the SAME clothing item ' +
+        '(identical design, logo and colors) from the reference image. Identity stays consistent. ';
+      if (sceneText) p += `Place them in ${sceneText}. `;
       if (styleText) p += `STYLE: ${styleText}. `;
       if (opts.campaignVision) p += `CAMPAIGN VISION: ${opts.campaignVision}. `;
-      if (opts.pose) p += `POSE GUIDE: ${opts.pose}. `;
       if (opts.edits) p += `EDITS: ${opts.edits}. `;
-      p += `SHOT: ${shot}, consistent with the campaign theme.`;
-      const urls = await falEdit(p, [approvedUrl, productUrl], 1);
-      out.push(urls[0]);
+      p += `SHOT: ${shot}, consistent with the campaign theme. ${QUALITY_BASE}`;
+      let url = await editScene(p, [approvedUrl]);
+      if (url) { url = await upscale(url); out.push(url); }
     }
     res.json({ success: true, images: out });
   } catch (e) {
@@ -175,17 +258,30 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 1 }, { nam
   }
 });
 
-// ---- upscale a chosen image to hi-res before download ----
+// ---- BRAND MODEL: generate a reusable model face from the picker, return its URL ----
+app.post('/api/brand-model', async (req, res) => {
+  try {
+    const m = req.body.model || {};
+    const prompt = `Full-body studio portrait of ${modelDescription(m)}, front-facing, neutral expression, ` +
+      `wearing plain neutral clothing, clean light-grey studio backdrop, even soft lighting. ${QUALITY_BASE}`;
+    const url = await genModel(prompt, m.seed);
+    if (!url) throw new Error('model generation failed');
+    res.json({ success: true, image: url, seed: m.seed || null });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// ---- standalone upscale ----
 app.post('/api/upscale', async (req, res) => {
   try {
     const { image } = req.body;
     if (!image) return res.status(400).json({ error: 'image url required' });
-    const url = await falUpscale(image);
-    res.json({ success: true, image: url });
+    res.json({ success: true, image: await upscale(image) });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY})`));
+app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY}) pipeline=tryon-v2`));
