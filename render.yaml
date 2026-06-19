@@ -1,0 +1,15 @@
+{
+  "$schema": "https://render.com/schema/render.yaml",
+  "services": [
+    {
+      "type": "web",
+      "name": "threadgen-server",
+      "runtime": "node",
+      "buildCommand": "npm install",
+      "startCommand": "npm start",
+      "envVars": [
+        { "key": "FAL_KEY", "sync": false }
+      ]
+    }
+  ]
+}
