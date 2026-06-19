@@ -151,15 +151,30 @@ async function genModel(prompt, seed) {
 }
 
 async function tryOn(modelUrl, garmentUrl, category = 'auto') {
-  const j = await falPost(FAL_TRYON, {
-    model_image: modelUrl,
-    garment_image: garmentUrl,
-    category,
-    garment_photo_type: 'auto',
-    mode: 'quality',
-    output_format: 'png',
-  });
-  return (j.images || [])[0]?.url;
+  try {
+    const j = await falPost(FAL_TRYON, {
+      model_image: modelUrl,
+      garment_image: garmentUrl,
+      category,
+      garment_photo_type: 'auto',
+      mode: 'quality',
+      output_format: 'png',
+    });
+    return (j.images || [])[0]?.url;
+  } catch (e) {
+    // Translate FASHN's raw API errors into plain English the user can act on
+    const m = String(e.message || e);
+    if (/body pose|detect.*pose|person_image/i.test(m)) {
+      throw new Error("Couldn't read the model photo. Use a clear, well-lit photo showing the whole upper body or full body, facing forward, in plain clothes — not a tight face close-up or a blurry pic.");
+    }
+    if (/garment|clothing|cloth_image/i.test(m)) {
+      throw new Error("Couldn't read the clothing photo. Use a clear flat-lay or hanger shot of the item, well-lit, filling most of the frame.");
+    }
+    if (/moderation|nsfw|explicit/i.test(m)) {
+      throw new Error('That image was blocked by content moderation. Try a different photo.');
+    }
+    throw new Error('Try-on failed — try a clearer model photo and product photo.');
+  }
 }
 
 async function editScene(prompt, imageUrls) {
@@ -218,7 +233,7 @@ app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 1 }, { n
       files.push(req.files.modelImg[0].path);
     } else {
       const pose = opts.pose ? opts.pose : 'natural relaxed standing pose';
-      let prompt = `Full-body photo of ${modelDescription(opts.model)}, ${pose}, wearing plain neutral fitted clothing. `;
+      let prompt = `Full-body photo of ${modelDescription(opts.model)} standing head to toe, ENTIRE body visible from head to feet, ${pose}, wearing plain neutral fitted clothing. `;
       if (sceneText) prompt += `Setting: ${sceneText}. `;
       else prompt += 'Setting: clean light-grey studio backdrop, even lighting. ';
       if (styleText) prompt += `STYLE: ${styleText}. `;
@@ -289,8 +304,9 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 1 }, { nam
 app.post('/api/brand-model', async (req, res) => {
   try {
     const m = req.body.model || {};
-    const prompt = `Full-body studio portrait of ${modelDescription(m)}, front-facing, neutral expression, ` +
-      `wearing plain neutral clothing, clean light-grey studio backdrop, even soft lighting. ${QUALITY_BASE}`;
+    const prompt = `Full-body photo of ${modelDescription(m)} standing head to toe, ENTIRE body visible from head to feet, ` +
+      `front-facing relaxed standing pose, neutral expression, wearing plain neutral fitted clothing, ` +
+      `clean light-grey studio backdrop, even soft lighting. ${QUALITY_BASE}`;
     const url = await genModel(prompt, m.seed);
     if (!url) throw new Error('model generation failed');
     res.json({ success: true, image: url, seed: m.seed || null });
