@@ -54,25 +54,52 @@ app.use(express.json({ limit: '25mb' }));
 
 const upload = multer({ dest: '/tmp/threadgen_uploads/' });
 
-// ---- style presets (validated prompts) ----
+// ---- style presets (photographer-grade prompts — the "secret sauce" behind each button) ----
+// Each button carries a full pro-photo recipe so a non-expert gets gallery-quality results
+// from one tap. Keep these rich and specific; this is where image quality is won.
 const STYLES = {
-  iphone:     'shot on iPhone, candid real-phone photo realism, natural daylight, true-to-life color',
-  vintage:    'vintage 1990s faded film color, soft analog grain, retro editorial mood, slight light leak',
-  streetwear: 'streetwear golden-hour urban campaign look, relaxed confident lookbook energy',
-  urban:      'gritty urban environment, concrete and city textures, moody overcast tone',
-  grainy:     'high-ISO grainy film look, heavy grain, high contrast, raw documentary feel',
-  clear:      'crisp clean high-clarity photo, bright even lighting, sharp focus',
-  studio:     'professional photography studio, seamless backdrop, soft-box lighting, polished e-commerce look',
+  iphone:
+    'shot on a modern iPhone Pro, computational-photography realism, natural daylight, true-to-life ' +
+    'color science, shallow natural depth of field with a softly blurred background, crisp in-focus subject, ' +
+    'authentic candid framing, no over-processing, looks like a real photo a friend snapped',
+  vintage:
+    'authentic 1990s 35mm film photograph on Kodak Gold, warm faded color palette, gentle halation glow ' +
+    'around highlights, fine organic film grain, soft analog contrast, slight light leak in one corner, ' +
+    'nostalgic retro editorial mood, scanned-negative texture',
+  streetwear:
+    'high-end streetwear brand campaign, golden-hour urban lighting, confident relaxed lookbook posture, ' +
+    'cinematic rim light separating subject from background, magazine-ad composition, premium color grade, ' +
+    'effortless cool energy, looks like a real fashion ad',
+  urban:
+    'gritty urban environment, weathered concrete and brick textures, moody overcast diffused light, ' +
+    'desaturated cinematic color grade with crushed shadows, documentary street-photography realism, ' +
+    'strong sense of place and atmosphere',
+  grainy:
+    'high-ISO analog film look, heavy pronounced grain structure, high contrast black-and-white-leaning tones, ' +
+    'raw unpolished documentary feel, deep shadows, hard directional light, photojournalistic edge',
+  clear:
+    'crisp ultra-clean high-clarity photograph, bright even diffused lighting, razor-sharp focus, ' +
+    'true accurate color, minimal noise, clean neutral background, premium catalog quality',
+  studio:
+    'professional photography studio, three-point soft-box lighting with a soft key and gentle fill, ' +
+    'visible catchlights in the eyes, seamless neutral paper sweep backdrop, polished e-commerce sharpness, ' +
+    'flattering controlled shadows, high-end product-campaign finish',
 };
 
-// ---- background / scene presets for the swap step ----
+// ---- background / scene presets (rich, so one tap = a believable real location) ----
 const SCENES = {
-  street:  'a real city street, urban sidewalk with shopfronts and concrete, natural daylight',
-  studio:  'a clean professional photo studio with a seamless neutral backdrop and soft-box lighting',
-  beach:   'a sunny beach with sand and ocean behind, warm golden natural light',
-  rooftop: 'an urban rooftop at golden hour, city skyline behind, warm directional light',
-  park:    'a green park with trees and natural daylight, soft background blur',
-  indoor:  'a stylish modern interior with warm ambient light and tasteful decor',
+  street:  'a real city street with shopfronts, parked cars and concrete sidewalk, natural daylight, ' +
+           'shallow depth of field blurring the background, authentic urban atmosphere',
+  studio:  'a clean professional photo studio with a seamless neutral paper backdrop, soft even key lighting ' +
+           'and gentle fill, subtle floor shadow, polished e-commerce look',
+  beach:   'a sunny beach with soft sand and ocean waves behind, warm golden natural light, gentle sea haze, ' +
+           'relaxed summer atmosphere, background softly out of focus',
+  rooftop: 'an urban rooftop at golden hour with a city skyline behind, warm directional sunlight, ' +
+           'long soft shadows, cinematic depth, modern lifestyle mood',
+  park:    'a green park with trees, dappled natural daylight and a softly blurred leafy background, ' +
+           'fresh outdoor atmosphere, calm and natural',
+  indoor:  'a stylish modern interior with warm ambient lighting, tasteful decor and large windows, ' +
+           'soft natural window light, cozy editorial lifestyle feel',
 };
 
 // Quality base baked under everything (real texture, beats the plastic AI look)
