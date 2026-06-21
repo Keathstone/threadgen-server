@@ -205,7 +205,7 @@ function toDataUri(filePath, mime) {
 }
 
 // ---- health ----
-app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'tryon-v2' }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'campaign-tryon-v4' }));
 app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES), scenes: Object.keys(SCENES) }));
 
 // ---- TEST shot: product mockup + model options -> ONE pixel-accurate try-on shot ----
