@@ -267,6 +267,7 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 1 }, { nam
     const opts = JSON.parse(req.body.options || '{}');
 
     const approvedUrl = toDataUri(req.files.approved[0].path, req.files.approved[0].mimetype);
+    const garmentUrl  = toDataUri(req.files.product[0].path,  req.files.product[0].mimetype);
     files.push(req.files.approved[0].path, req.files.product[0].path);
 
     const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
@@ -280,19 +281,39 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 1 }, { nam
       'detail shot of the clothing item',
     ];
 
+    // GOLDEN RULE: try-on goes LAST on EVERY shot, never edit after it.
+    // For each shot we (1) edit the approved photo to vary pose/angle/scene while
+    // keeping the SAME person, then (2) re-run FASHN try-on with the REAL garment so
+    // the actual logo pixels (ARL / "THE WORLD AIN'T LOYAL") are restored exactly —
+    // the edit pass mangles the logo, the try-on pass puts the real one back — then (3) upscale.
     const out = [];
+    const errors = [];
     for (const shot of shots) {
-      let p = 'Use the SAME exact person (same face, skin tone, hair) and the SAME clothing item ' +
-        '(identical design, logo and colors) from the reference image. Identity stays consistent. ';
-      if (sceneText) p += `Place them in ${sceneText}. `;
-      if (styleText) p += `STYLE: ${styleText}. `;
-      if (opts.campaignVision) p += `CAMPAIGN VISION: ${opts.campaignVision}. `;
-      if (opts.edits) p += `EDITS: ${opts.edits}. `;
-      p += `SHOT: ${shot}, consistent with the campaign theme. ${QUALITY_BASE}`;
-      let url = await editScene(p, [approvedUrl]);
-      if (url) { url = await upscale(url); out.push(url); }
+      try {
+        let p = 'Use the SAME exact person — same face, skin tone, hair, body — from the reference image. ' +
+          'Keep them wearing a plain top of the same general type and color (it will be replaced later, so ' +
+          'do not worry about logo accuracy). Identity MUST stay consistent across shots. ';
+        if (sceneText) p += `Place them in ${sceneText}. `;
+        if (styleText) p += `STYLE: ${styleText}. `;
+        if (opts.campaignVision) p += `CAMPAIGN VISION: ${opts.campaignVision}. `;
+        if (opts.edits) p += `EDITS: ${opts.edits}. `;
+        p += `SHOT: ${shot}, consistent with the campaign theme. Full body or upper body clearly visible, facing forward. ${QUALITY_BASE}`;
+
+        const posed = await editScene(p, [approvedUrl]);
+        if (!posed) { errors.push(`${shot}: pose edit failed`); continue; }
+
+        // try-on LAST: warp the ACTUAL garment pixels back on so the logo is exact
+        let url = await tryOn(posed, garmentUrl, opts.category || 'auto');
+        if (!url) { errors.push(`${shot}: try-on failed`); continue; }
+
+        url = await upscale(url);
+        out.push(url);
+      } catch (e) {
+        errors.push(`${shot}: ${String(e.message || e)}`);
+      }
     }
-    res.json({ success: true, images: out });
+    if (!out.length) throw new Error(errors.join(' | ') || 'campaign produced no images');
+    res.json({ success: true, images: out, ...(errors.length ? { warnings: errors } : {}) });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   } finally {
