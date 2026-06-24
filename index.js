@@ -168,9 +168,11 @@ async function genModel(prompt, seed) {
 //   desc: the user's free-text product description (locks ambiguous details in words).
 //   modelUrl: optional approved/uploaded model image to keep identity consistent.
 async function flux2Garment({ garmentUrls = [], desc = '', modelDesc = '', modelUrl = null,
-                              sceneText = '', styleText = '', pose = '', edits = '', seed = null }) {
+                              sceneText = '', styleText = '', pose = '', edits = '', seed = null,
+                              sceneRefUrl = null, refWhat = [] }) {
   const refs = [...garmentUrls];
   if (modelUrl) refs.unshift(modelUrl); // model first so identity anchors
+  if (sceneRefUrl) refs.push(sceneRefUrl); // scene/pose reference last
 
   let p = '';
   if (modelUrl) {
@@ -188,9 +190,20 @@ async function flux2Garment({ garmentUrls = [], desc = '', modelDesc = '', model
        'label, tag, patch and small detail copied faithfully and kept legible. ';
   if (desc) p += `Product description (treat as ground truth, leave no room for error): ${desc}. `;
   p += 'The garment must drape with natural realistic fabric folds that follow the body and gravity. ';
-  if (pose) p += `Pose: ${pose}. `;
-  else p += 'Relaxed confident streetwear posture. ';
-  if (sceneText) p += `Setting: ${sceneText}. `;
+  // Scene/pose reference: the LAST reference image. Tell FLUX2 exactly what to copy from it.
+  if (sceneRefUrl) {
+    const wantPose = !refWhat.length || refWhat.includes('pose');
+    const wantBg   = !refWhat.length || refWhat.includes('background');
+    p += 'The FINAL reference image is a scene/pose reference — ';
+    if (wantPose && wantBg) p += 'copy the EXACT same body pose, stance and camera angle AND the exact same background, location and lighting from it. ';
+    else if (wantPose) p += 'copy the EXACT same body pose, stance and camera angle from it (ignore its background). ';
+    else if (wantBg) p += 'copy the exact same background, location and lighting from it (ignore its pose). ';
+    p += 'Match it faithfully. ';
+  } else {
+    if (pose) p += `Pose: ${pose}. `;
+    else p += 'Relaxed confident streetwear posture. ';
+    if (sceneText) p += `Setting: ${sceneText}. `;
+  }
   if (styleText) p += `Photographic style: ${styleText}. `;
   if (edits) p += `${edits}. `;
   p += 'CRITICAL — this must look like a REAL candid photo of a REAL person, NOT a fashion render: ' +
@@ -275,7 +288,7 @@ function toDataUri(filePath, mime) {
 }
 
 // ---- health ----
-app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'flux2-garment-v7' }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'flux2-garment-v8' }));
 app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES), scenes: Object.keys(SCENES) }));
 
 // ---- TEST shot: real garment photo(s) + model options -> ONE faithful campaign shot ----
@@ -283,7 +296,7 @@ app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES), sce
 // their text description as references, and (optionally) an approved/uploaded model image as an
 // identity anchor, then redraws ONE realistic photo of that person wearing the EXACT garment.
 // No warp, no invented fake folds, no smeared patch. Upscale at the end for crisp real texture.
-app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 4 }, { name: 'modelImg', maxCount: 1 }]), async (req, res) => {
+app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 4 }, { name: 'modelImg', maxCount: 1 }, { name: 'sceneRef', maxCount: 1 }]), async (req, res) => {
   const files = [];
   try {
     if (!req.files || !req.files.product || !req.files.product.length)
@@ -295,6 +308,13 @@ app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 4 }, { n
 
     const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
     const styleText = (opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; ');
+
+    // Optional scene/pose reference photo — FLUX2 copies its pose and/or background.
+    let sceneRefUrl = null;
+    if (req.files.sceneRef) {
+      sceneRefUrl = toDataUri(req.files.sceneRef[0].path, req.files.sceneRef[0].mimetype);
+      files.push(req.files.sceneRef[0].path);
+    }
 
     // Optional identity anchor: uploaded/saved model photo. If none, FLUX2 invents a model
     // from the picker description and keeps it consistent via the returned seed.
@@ -314,6 +334,8 @@ app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 4 }, { n
       pose: opts.pose || '',
       edits: opts.edits || '',
       seed: opts.model && opts.model.seed,
+      sceneRefUrl,
+      refWhat: opts.refWhat || [],
     });
     if (!rawUrl) throw new Error('garment render failed');
 
@@ -333,7 +355,7 @@ app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 4 }, { n
 // garment anchor) PLUS the real product photos (garment fidelity), then redraws the SAME
 // person wearing the SAME exact garment in a new pose/angle/scene. One call per shot — no
 // FASHN, no destructive post-edit. Try/catch per shot so one miss doesn't kill the batch.
-app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 4 }, { name: 'approved', maxCount: 1 }]), async (req, res) => {
+app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 4 }, { name: 'approved', maxCount: 1 }, { name: 'sceneRef', maxCount: 1 }]), async (req, res) => {
   const files = [];
   try {
     if (!req.files || !req.files.product || !req.files.product.length || !req.files.approved)
@@ -343,6 +365,14 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 4 }, { nam
     const approvedUrl = toDataUri(req.files.approved[0].path, req.files.approved[0].mimetype);
     files.push(req.files.approved[0].path);
     const garmentUrls = req.files.product.map(f => { files.push(f.path); return toDataUri(f.path, f.mimetype); });
+
+    // Optional scene reference — its BACKGROUND/location is held across all campaign shots
+    // (pose is intentionally varied per shot, so we copy background only here).
+    let sceneRefUrl = null;
+    if (req.files.sceneRef) {
+      sceneRefUrl = toDataUri(req.files.sceneRef[0].path, req.files.sceneRef[0].mimetype);
+      files.push(req.files.sceneRef[0].path);
+    }
 
     const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
     const styleText = (opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; ');
@@ -360,14 +390,16 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 4 }, { nam
     for (const shot of shots) {
       try {
         // refs: approved test photo FIRST (locks identity + the already-correct garment),
-        // then the raw product photos (reinforce garment fidelity each shot).
+        // then the raw product photos (reinforce garment fidelity each shot), then scene ref.
         const refs = [approvedUrl, ...garmentUrls];
+        if (sceneRefUrl) refs.push(sceneRefUrl);
         let p = 'Use the SAME exact person shown in the FIRST reference image — same face, same ' +
           'facial features, same skin tone, same hairstyle, same body. Keep their identity perfectly ' +
           'consistent. Keep them wearing EXACTLY the same garment shown in the reference images — ' +
           'reproduce the cut, sleeve length, fabric texture, every printed graphic, all text with the ' +
           'same wording/fonts/colors, and every label/patch faithfully and legibly. ';
-        if (sceneText) p += `Setting: ${sceneText}. `;
+        if (sceneRefUrl) p += 'Use the SAME background, location and lighting as shown in the FINAL reference image. ';
+        else if (sceneText) p += `Setting: ${sceneText}. `;
         if (styleText) p += `Photographic style: ${styleText}. `;
         if (opts.campaignVision) p += `Campaign vision: ${opts.campaignVision}. `;
         if (opts.edits) p += `${opts.edits}. `;
@@ -427,4 +459,4 @@ app.post('/api/upscale', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY}) pipeline=flux2-garment-v7`));
+app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY}) pipeline=flux2-garment-v8`));
