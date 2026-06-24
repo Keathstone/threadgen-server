@@ -31,7 +31,12 @@ const FAL_KEY = process.env.FAL_KEY;
 const FAL_GEN     = 'https://fal.run/fal-ai/flux/dev';                     // text -> image (brand model, real skin)
 const FAL_GEN_ALT = 'https://fal.run/fal-ai/gemini-25-flash-image';        // fallback generator
 const FAL_EDIT    = 'https://fal.run/fal-ai/gemini-25-flash-image/edit';   // image edit (scene / background)
-const FAL_TRYON   = 'https://fal.run/fal-ai/fashn/tryon/v1.6';             // garment try-on (pixel-accurate)
+// FLUX 2 Pro multi-reference edit = the ENGINE. A frontier model that REDRAWS the whole
+// photo while faithfully copying the real garment from reference images (same class of tool
+// as ChatGPT image gen). This REPLACES the old FASHN try-on warper, which could only bend a
+// flat garment onto a body and invented fake fabric folds / smeared small patches.
+const FAL_FLUX2   = 'https://fal.run/fal-ai/flux-2-pro/edit';              // garment-on-model (PRIMARY engine)
+const FAL_TRYON   = 'https://fal.run/fal-ai/fashn/tryon/v1.6';             // legacy try-on (fallback only)
 const FAL_UPSCALE = 'https://fal.run/fal-ai/clarity-upscaler';            // detail + real texture
 
 const app = express();
@@ -131,15 +136,20 @@ async function falPost(url, body) {
 async function genModel(prompt, seed) {
   // FLUX dev renders grittier, realistic skin (beats Gemini's plastic faces).
   // Portrait 3:4, real-photo framing. Falls back to Gemini if FLUX hiccups.
-  const realPrefix = 'Candid real photograph, shot on a full-frame camera, 50mm lens, natural lighting, ' +
-    'authentic editorial fashion photo. ';
+  // STRONG realism block: Don rejects fake/blurry faces — we force candid-iPhone
+  // imperfection (pores, asymmetry, real skin) so the model reads like a real person.
+  const realPrefix =
+    'Candid amateur iPhone photograph of a REAL person, shot handheld in natural light, ' +
+    'authentic and slightly imperfect — visible skin pores, subtle skin texture, natural ' +
+    'facial asymmetry, real human imperfections, NOT a model render, NOT airbrushed, NOT ' +
+    'plastic, NOT smooth CGI skin, sharp in-focus face with true-to-life detail. ';
   try {
     const j = await falPost(FAL_GEN, {
       prompt: realPrefix + prompt,
       image_size: 'portrait_4_3',
       num_images: 1,
       guidance_scale: 3.5,
-      num_inference_steps: 30,
+      num_inference_steps: 36,
       enable_safety_checker: true,
       ...(seed != null ? { seed } : {}),
     });
@@ -150,13 +160,68 @@ async function genModel(prompt, seed) {
   return (j.images || [])[0]?.url;
 }
 
-async function tryOn(modelUrl, garmentUrl, category = 'auto') {
+// ===== PRIMARY ENGINE: FLUX 2 Pro multi-reference =====
+// Redraws the entire photo while faithfully copying the REAL garment from the reference
+// image(s). One call does garment-fidelity + a realistic model + scene — no separate warp,
+// no invented fake folds, no smeared patch. Replaces the FASHN try-on pipeline.
+//   garmentUrls: array of the user's product photos (front/back/detail) — all fed as refs.
+//   desc: the user's free-text product description (locks ambiguous details in words).
+//   modelUrl: optional approved/uploaded model image to keep identity consistent.
+async function flux2Garment({ garmentUrls = [], desc = '', modelDesc = '', modelUrl = null,
+                              sceneText = '', styleText = '', pose = '', edits = '', seed = null }) {
+  const refs = [...garmentUrls];
+  if (modelUrl) refs.unshift(modelUrl); // model first so identity anchors
+
+  let p = '';
+  if (modelUrl) {
+    p += 'Use the SAME exact person shown in the FIRST reference image — same face, same facial ' +
+         'features, same skin tone, same hairstyle. Keep their identity perfectly consistent. ';
+    p += `Dress that person in EXACTLY the garment shown in the other reference image(s). `;
+  } else {
+    p += `A candid iPhone photograph of ${modelDesc || 'a real person'} `;
+    p += `wearing EXACTLY the garment shown in the reference image(s). `;
+  }
+  p += 'Reproduce the garment with total fidelity: the same cut and RELAXED streetwear fit and ' +
+       'silhouette (not slim, not tailored — keep it loose like the reference), the same sleeve ' +
+       'length, the same fabric type and knit/weave/ribbed texture clearly visible, every printed ' +
+       'graphic and all text reproduced exactly with the same wording, fonts and colors, and every ' +
+       'label, tag, patch and small detail copied faithfully and kept legible. ';
+  if (desc) p += `Product description (treat as ground truth, leave no room for error): ${desc}. `;
+  p += 'The garment must drape with natural realistic fabric folds that follow the body and gravity. ';
+  if (pose) p += `Pose: ${pose}. `;
+  else p += 'Relaxed confident streetwear posture. ';
+  if (sceneText) p += `Setting: ${sceneText}. `;
+  if (styleText) p += `Photographic style: ${styleText}. `;
+  if (edits) p += `${edits}. `;
+  p += 'CRITICAL — this must look like a REAL candid photo of a REAL person, NOT a fashion render: ' +
+       'authentic imperfect human skin with visible pores, fine lines, slight blemishes and natural ' +
+       'oiliness, natural facial asymmetry, flyaway hairs, real-world ambient lighting with uneven ' +
+       'shadows, NOT airbrushed, NOT retouched, NOT smooth, NOT plastic, NOT CGI, NOT a glossy studio ' +
+       'model shot. Shot handheld on a phone with slight motion and real-camera sensor grain, ' +
+       'looks like a photo a friend snapped on the street, sharp in-focus face.';
+
+  const j = await falPost(FAL_FLUX2, {
+    prompt: p,
+    image_urls: refs,
+    image_size: 'portrait_4_3',
+    output_format: 'png',
+    safety_tolerance: '5',
+    ...(seed != null ? { seed } : {}),
+  });
+  return (j.images || [])[0]?.url;
+}
+
+async function tryOn(modelUrl, garmentUrl, category = 'auto', garmentType = 'flat-lay') {
   try {
     const j = await falPost(FAL_TRYON, {
       model_image: modelUrl,
       garment_image: garmentUrl,
       category,
-      garment_photo_type: 'auto',
+      garment_photo_type: garmentType,   // 'flat-lay' for product mockups (our case), 'model' for on-body refs
+      segmentation_free: true,           // CRITICAL: let the garment's OWN silhouette (e.g. long sleeves)
+                                         // carry through instead of clipping it to the model's existing
+                                         // short-sleeve region. Without this, long-sleeve flat-lays render
+                                         // as short sleeves (Don's garment-shape bug).
       mode: 'quality',
       output_format: 'png',
     });
@@ -182,18 +247,23 @@ async function editScene(prompt, imageUrls) {
   return (j.images || [])[0]?.url;
 }
 
-async function upscale(imageUrl) {
+async function upscale(imageUrl, opts = {}) {
   try {
-    // Higher creativity + a texture prompt makes the upscaler ADD real skin detail and
-    // photographic grain instead of just sharpening the plastic look. This is the
-    // final pass on every image, so it's what kills the airbrushed AI face.
+    // IDENTITY-SAFE upscale. The old creativity:0.4 was high enough to REDRAW facial
+    // features — it melted the model's identity after try-on (Don's #1 complaint:
+    // "model in test photo doesn't match"). We now sharpen at low creativity so the
+    // face/identity is preserved, and lean on FLUX dev (grittier skin) for realism
+    // instead of letting the upscaler hallucinate texture over a new face.
+    //   preserveIdentity (default true): gentle, face stays exact.
+    //   preserveIdentity false: stronger texture pass (use only when no identity to keep).
+    const preserve = opts.preserveIdentity !== false;
     const j = await falPost(FAL_UPSCALE, {
       image_url: imageUrl,
       scale_factor: 2.0,
-      creativity: 0.4,
-      resemblance: 0.75,
-      prompt: 'realistic human skin with visible pores and fine texture, natural photographic film grain, ' +
-        'sharp real-camera detail, not smooth, not airbrushed, not plastic',
+      creativity: preserve ? 0.15 : 0.35,
+      resemblance: preserve ? 0.95 : 0.8,
+      prompt: 'sharp real-camera detail, realistic skin with fine natural texture, subtle photographic ' +
+        'grain, keep the face and identity exactly the same, not smooth, not airbrushed, not plastic',
     });
     return (j.image && j.image.url) || ((j.images || [])[0] || {}).url || imageUrl;
   } catch { return imageUrl; } // upscale is a bonus; never fail the request over it
@@ -205,52 +275,52 @@ function toDataUri(filePath, mime) {
 }
 
 // ---- health ----
-app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'campaign-tryon-v4' }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'flux2-garment-v7' }));
 app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES), scenes: Object.keys(SCENES) }));
 
-// ---- TEST shot: product mockup + model options -> ONE pixel-accurate try-on shot ----
-// Flow (v3): generate brand model ALREADY in the desired scene/style (or reuse saved)
-//   -> FASHN try-on garment LAST so the logo is never re-rendered -> upscale w/ texture.
-// We deliberately do NOT run a post try-on edit pass, because that re-draws the garment
-// and destroys the logo + re-smooths skin. Scene/style live in the model prompt instead.
-app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 1 }, { name: 'modelImg', maxCount: 1 }]), async (req, res) => {
+// ---- TEST shot: real garment photo(s) + model options -> ONE faithful campaign shot ----
+// ENGINE: FLUX 2 Pro multi-reference (replaces FASHN). Feeds ALL the user's product photos +
+// their text description as references, and (optionally) an approved/uploaded model image as an
+// identity anchor, then redraws ONE realistic photo of that person wearing the EXACT garment.
+// No warp, no invented fake folds, no smeared patch. Upscale at the end for crisp real texture.
+app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 4 }, { name: 'modelImg', maxCount: 1 }]), async (req, res) => {
   const files = [];
   try {
-    if (!req.files || !req.files.product) return res.status(400).json({ error: 'product image required' });
+    if (!req.files || !req.files.product || !req.files.product.length)
+      return res.status(400).json({ error: 'product image required' });
     const opts = JSON.parse(req.body.options || '{}');
 
-    const garmentUrl = toDataUri(req.files.product[0].path, req.files.product[0].mimetype);
-    files.push(req.files.product[0].path);
+    // ALL product photos become references (front / back / detail). More = better fidelity.
+    const garmentUrls = req.files.product.map(f => { files.push(f.path); return toDataUri(f.path, f.mimetype); });
 
     const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
     const styleText = (opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; ');
 
-    // 1) brand model: reuse a saved model image if provided, else generate it
-    //    ALREADY standing in the right scene/style (so no destructive edit later)
-    let modelUrl;
+    // Optional identity anchor: uploaded/saved model photo. If none, FLUX2 invents a model
+    // from the picker description and keeps it consistent via the returned seed.
+    let modelUrl = null;
     if (req.files.modelImg) {
       modelUrl = toDataUri(req.files.modelImg[0].path, req.files.modelImg[0].mimetype);
       files.push(req.files.modelImg[0].path);
-    } else {
-      const pose = opts.pose ? opts.pose : 'natural relaxed standing pose';
-      let prompt = `Full-body photo of ${modelDescription(opts.model)} standing head to toe, ENTIRE body visible from head to feet, ${pose}, wearing plain neutral fitted clothing. `;
-      if (sceneText) prompt += `Setting: ${sceneText}. `;
-      else prompt += 'Setting: clean light-grey studio backdrop, even lighting. ';
-      if (styleText) prompt += `STYLE: ${styleText}. `;
-      if (opts.edits) prompt += `Scene details: ${opts.edits}. `;
-      prompt += QUALITY_BASE;
-      modelUrl = await genModel(prompt, opts.model && opts.model.seed);
-      if (!modelUrl) throw new Error('model generation failed');
     }
 
-    // 2) try-on LAST: warp the ACTUAL garment pixels onto the model (logo/text stay exact)
-    let url = await tryOn(modelUrl, garmentUrl, opts.category || 'auto');
-    if (!url) throw new Error('try-on failed');
+    const rawUrl = await flux2Garment({
+      garmentUrls,
+      desc: opts.productDesc || '',
+      modelDesc: modelDescription(opts.model),
+      modelUrl,
+      sceneText,
+      styleText,
+      pose: opts.pose || '',
+      edits: opts.edits || '',
+      seed: opts.model && opts.model.seed,
+    });
+    if (!rawUrl) throw new Error('garment render failed');
 
-    // 3) forced upscale on every output -> real texture, breaks the plastic look
-    url = await upscale(url);
+    // forced upscale -> crisp real texture (identity-safe, won't melt the face)
+    const url = await upscale(rawUrl);
 
-    res.json({ success: true, image: url, modelImage: modelUrl.startsWith('data:') ? null : modelUrl });
+    res.json({ success: true, image: url, raw: rawUrl });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   } finally {
@@ -258,55 +328,64 @@ app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 1 }, { n
   }
 });
 
-// ---- CAMPAIGN: approved anchor + product -> 5 themed shots, same model+garment ----
-app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 1 }, { name: 'approved', maxCount: 1 }]), async (req, res) => {
+// ---- CAMPAIGN: approved anchor + product photo(s) -> themed shots, same model+garment ----
+// ENGINE: FLUX 2 Pro multi-reference. Each shot feeds the approved test photo (identity +
+// garment anchor) PLUS the real product photos (garment fidelity), then redraws the SAME
+// person wearing the SAME exact garment in a new pose/angle/scene. One call per shot — no
+// FASHN, no destructive post-edit. Try/catch per shot so one miss doesn't kill the batch.
+app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 4 }, { name: 'approved', maxCount: 1 }]), async (req, res) => {
   const files = [];
   try {
-    if (!req.files || !req.files.product || !req.files.approved)
+    if (!req.files || !req.files.product || !req.files.product.length || !req.files.approved)
       return res.status(400).json({ error: 'product and approved test image required' });
     const opts = JSON.parse(req.body.options || '{}');
 
     const approvedUrl = toDataUri(req.files.approved[0].path, req.files.approved[0].mimetype);
-    const garmentUrl  = toDataUri(req.files.product[0].path,  req.files.product[0].mimetype);
-    files.push(req.files.approved[0].path, req.files.product[0].path);
+    files.push(req.files.approved[0].path);
+    const garmentUrls = req.files.product.map(f => { files.push(f.path); return toDataUri(f.path, f.mimetype); });
 
     const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
     const styleText = (opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; ');
 
     const shots = [
-      'wide full-body shot',
-      'candid mid-action moment',
-      'upper-body close-up',
-      'three-quarter angle',
-      'detail shot of the clothing item',
+      'wide full-body shot, full figure head to toe',
+      'candid mid-action moment, natural movement',
+      'upper-body close-up portrait',
+      'three-quarter angle fashion shot',
+      'detail shot focused on the clothing item and its print',
     ];
 
-    // GOLDEN RULE: try-on goes LAST on EVERY shot, never edit after it.
-    // For each shot we (1) edit the approved photo to vary pose/angle/scene while
-    // keeping the SAME person, then (2) re-run FASHN try-on with the REAL garment so
-    // the actual logo pixels (ARL / "THE WORLD AIN'T LOYAL") are restored exactly —
-    // the edit pass mangles the logo, the try-on pass puts the real one back — then (3) upscale.
     const out = [];
     const errors = [];
     for (const shot of shots) {
       try {
-        let p = 'Use the SAME exact person — same face, skin tone, hair, body — from the reference image. ' +
-          'Keep them wearing a plain top of the same general type and color (it will be replaced later, so ' +
-          'do not worry about logo accuracy). Identity MUST stay consistent across shots. ';
-        if (sceneText) p += `Place them in ${sceneText}. `;
-        if (styleText) p += `STYLE: ${styleText}. `;
-        if (opts.campaignVision) p += `CAMPAIGN VISION: ${opts.campaignVision}. `;
-        if (opts.edits) p += `EDITS: ${opts.edits}. `;
-        p += `SHOT: ${shot}, consistent with the campaign theme. Full body or upper body clearly visible, facing forward. ${QUALITY_BASE}`;
+        // refs: approved test photo FIRST (locks identity + the already-correct garment),
+        // then the raw product photos (reinforce garment fidelity each shot).
+        const refs = [approvedUrl, ...garmentUrls];
+        let p = 'Use the SAME exact person shown in the FIRST reference image — same face, same ' +
+          'facial features, same skin tone, same hairstyle, same body. Keep their identity perfectly ' +
+          'consistent. Keep them wearing EXACTLY the same garment shown in the reference images — ' +
+          'reproduce the cut, sleeve length, fabric texture, every printed graphic, all text with the ' +
+          'same wording/fonts/colors, and every label/patch faithfully and legibly. ';
+        if (sceneText) p += `Setting: ${sceneText}. `;
+        if (styleText) p += `Photographic style: ${styleText}. `;
+        if (opts.campaignVision) p += `Campaign vision: ${opts.campaignVision}. `;
+        if (opts.edits) p += `${opts.edits}. `;
+        p += `Shot: ${shot}, consistent with the campaign theme. ` +
+          'Authentic imperfect real human skin with visible pores and natural texture, NOT airbrushed, ' +
+          'NOT plastic, sharp in-focus face. Natural realistic fabric drape. Semi-iPhone photo quality, ' +
+          'soft natural light, slight real-camera grain, looks like a real photograph.';
 
-        const posed = await editScene(p, [approvedUrl]);
-        if (!posed) { errors.push(`${shot}: pose edit failed`); continue; }
+        const rawUrl = await falPost(FAL_FLUX2, {
+          prompt: p,
+          image_urls: refs,
+          image_size: 'portrait_4_3',
+          output_format: 'png',
+          safety_tolerance: '5',
+        }).then(j => (j.images || [])[0]?.url);
+        if (!rawUrl) { errors.push(`${shot}: render failed`); continue; }
 
-        // try-on LAST: warp the ACTUAL garment pixels back on so the logo is exact
-        let url = await tryOn(posed, garmentUrl, opts.category || 'auto');
-        if (!url) { errors.push(`${shot}: try-on failed`); continue; }
-
-        url = await upscale(url);
+        const url = await upscale(rawUrl);
         out.push(url);
       } catch (e) {
         errors.push(`${shot}: ${String(e.message || e)}`);
@@ -348,4 +427,4 @@ app.post('/api/upscale', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY}) pipeline=tryon-v2`));
+app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY}) pipeline=flux2-garment-v7`));
