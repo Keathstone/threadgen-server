@@ -288,8 +288,8 @@ function toDataUri(filePath, mime) {
 }
 
 // ---- health ----
-app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'flux2-garment-v8' }));
-app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES), scenes: Object.keys(SCENES) }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'flux2-garment-v9' }));
+app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES), scenes: Object.keys(SCENES), recipes: STYLES }));
 
 // ---- TEST shot: real garment photo(s) + model options -> ONE faithful campaign shot ----
 // ENGINE: FLUX 2 Pro multi-reference (replaces FASHN). Feeds ALL the user's product photos +
@@ -307,7 +307,7 @@ app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 4 }, { n
     const garmentUrls = req.files.product.map(f => { files.push(f.path); return toDataUri(f.path, f.mimetype); });
 
     const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
-    const styleText = (opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; ');
+    const styleText = [(opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; '), (opts.customStyle || '').trim()].filter(Boolean).join('; ');
 
     // Optional scene/pose reference photo — FLUX2 copies its pose and/or background.
     let sceneRefUrl = null;
@@ -375,7 +375,7 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 4 }, { nam
     }
 
     const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
-    const styleText = (opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; ');
+    const styleText = [(opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; '), (opts.customStyle || '').trim()].filter(Boolean).join('; ');
 
     const shots = [
       'wide full-body shot, full figure head to toe',
@@ -459,4 +459,4 @@ app.post('/api/upscale', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY}) pipeline=flux2-garment-v8`));
+app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY}) pipeline=flux2-garment-v9`));
