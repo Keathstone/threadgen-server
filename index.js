@@ -6,6 +6,7 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
 
@@ -26,6 +27,10 @@ function loadEnv() {
 loadEnv();
 
 const FAL_KEY = process.env.FAL_KEY;
+// Shared-secret app key: the frontend sends this on every request so randoms who find the
+// public API URL can't burn our FAL credits. Not a real user-auth system — just a lock on
+// a public endpoint. Set THREADGEN_APP_KEY in Render env vars + the frontend's localStorage.
+const APP_KEY = process.env.THREADGEN_APP_KEY || null;
 
 // ---- FAL endpoints ----
 const FAL_GEN     = 'https://fal.run/fal-ai/flux/dev';                     // text -> image (brand model, real skin)
@@ -57,7 +62,29 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '25mb' }));
 
-const upload = multer({ dest: '/tmp/threadgen_uploads/' });
+const upload = multer({
+  dest: '/tmp/threadgen_uploads/',
+  limits: { fileSize: 10 * 1024 * 1024, files: 6 }, // 10MB/file cap, avoid disk/cost abuse
+});
+
+// ---- shared-secret gate on the expensive/paid routes ----
+// Skips the check entirely if THREADGEN_APP_KEY isn't set (so local dev without the env var
+// still works) — set it in production (Render) to actually lock the API down.
+function requireAppKey(req, res, next) {
+  if (!APP_KEY) return next();
+  const supplied = req.get('X-App-Key');
+  if (supplied === APP_KEY) return next();
+  return res.status(401).json({ error: 'unauthorized' });
+}
+
+// ---- rate limiting: caps how many paid FAL calls one IP can trigger ----
+const genLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 min
+  max: 20,                  // 20 generations per IP per window — generous for real use, blocks bots
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests — slow down and try again in a few minutes.' },
+});
 
 // ---- style presets (photographer-grade prompts — the "secret sauce" behind each button) ----
 // Each button carries a full pro-photo recipe so a non-expert gets gallery-quality results
@@ -296,7 +323,7 @@ app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES), sce
 // their text description as references, and (optionally) an approved/uploaded model image as an
 // identity anchor, then redraws ONE realistic photo of that person wearing the EXACT garment.
 // No warp, no invented fake folds, no smeared patch. Upscale at the end for crisp real texture.
-app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 4 }, { name: 'modelImg', maxCount: 1 }, { name: 'sceneRef', maxCount: 1 }]), async (req, res) => {
+app.post('/api/test-photo', requireAppKey, genLimiter, upload.fields([{ name: 'product', maxCount: 4 }, { name: 'modelImg', maxCount: 1 }, { name: 'sceneRef', maxCount: 1 }]), async (req, res) => {
   const files = [];
   try {
     if (!req.files || !req.files.product || !req.files.product.length)
@@ -355,7 +382,7 @@ app.post('/api/test-photo', upload.fields([{ name: 'product', maxCount: 4 }, { n
 // garment anchor) PLUS the real product photos (garment fidelity), then redraws the SAME
 // person wearing the SAME exact garment in a new pose/angle/scene. One call per shot — no
 // FASHN, no destructive post-edit. Try/catch per shot so one miss doesn't kill the batch.
-app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 4 }, { name: 'approved', maxCount: 1 }, { name: 'sceneRef', maxCount: 1 }]), async (req, res) => {
+app.post('/api/campaign', requireAppKey, genLimiter, upload.fields([{ name: 'product', maxCount: 4 }, { name: 'approved', maxCount: 1 }, { name: 'sceneRef', maxCount: 1 }]), async (req, res) => {
   const files = [];
   try {
     if (!req.files || !req.files.product || !req.files.product.length || !req.files.approved)
@@ -433,7 +460,7 @@ app.post('/api/campaign', upload.fields([{ name: 'product', maxCount: 4 }, { nam
 });
 
 // ---- BRAND MODEL: generate a reusable model face from the picker, return its URL ----
-app.post('/api/brand-model', async (req, res) => {
+app.post('/api/brand-model', requireAppKey, genLimiter, async (req, res) => {
   try {
     const m = req.body.model || {};
     const prompt = `Full-body photo of ${modelDescription(m)} standing head to toe, ENTIRE body visible from head to feet, ` +
@@ -448,7 +475,7 @@ app.post('/api/brand-model', async (req, res) => {
 });
 
 // ---- standalone upscale ----
-app.post('/api/upscale', async (req, res) => {
+app.post('/api/upscale', requireAppKey, genLimiter, async (req, res) => {
   try {
     const { image } = req.body;
     if (!image) return res.status(400).json({ error: 'image url required' });
