@@ -41,6 +41,8 @@ const FAL_EDIT    = 'https://fal.run/fal-ai/gemini-25-flash-image/edit';   // im
 // as ChatGPT image gen). This REPLACES the old FASHN try-on warper, which could only bend a
 // flat garment onto a body and invented fake fabric folds / smeared small patches.
 const FAL_FLUX2   = 'https://fal.run/fal-ai/flux-2-pro/edit';              // garment-on-model (PRIMARY engine)
+const FAL_NANO    = 'https://fal.run/fal-ai/nano-banana-pro/edit';         // premium realism / Gemini 3 Pro Image
+const FAL_IDEO4   = 'https://fal.run/ideogram/v4/image-to-image';          // logo/text polish mode
 const FAL_TRYON   = 'https://fal.run/fal-ai/fashn/tryon/v1.6';             // legacy try-on (fallback only)
 const FAL_UPSCALE = 'https://fal.run/fal-ai/clarity-upscaler';            // detail + real texture
 
@@ -160,6 +162,24 @@ async function falPost(url, body) {
   return r.json();
 }
 
+function firstImageUrl(j) {
+  return (j.images || [])[0]?.url || (j.image && j.image.url) || j.image_url || j.image || j.url || null;
+}
+
+function outputMode(opts = {}) {
+  const m = String(opts.outputMode || opts.engine || 'standard').toLowerCase();
+  return ['standard', 'premium', 'logo', 'product'].includes(m) ? m : 'standard';
+}
+
+function modeCost(mode) {
+  return ({
+    standard: '$0.12-$0.25',
+    premium: '$0.25-$0.55',
+    logo: '$0.22-$0.35',
+    product: '$0.03-$0.10',
+  })[mode] || '$0.12-$0.25';
+}
+
 async function genModel(prompt, seed) {
   // FLUX dev renders grittier, realistic skin (beats Gemini's plastic faces).
   // Portrait 3:4, real-photo framing. Falls back to Gemini if FLUX hiccups.
@@ -248,7 +268,89 @@ async function flux2Garment({ garmentUrls = [], desc = '', modelDesc = '', model
     safety_tolerance: '5',
     ...(seed != null ? { seed } : {}),
   });
-  return (j.images || [])[0]?.url;
+  return firstImageUrl(j);
+}
+
+async function nanoGarment({ garmentUrls = [], desc = '', modelDesc = '', modelUrl = null,
+                             sceneText = '', styleText = '', pose = '', edits = '', seed = null,
+                             sceneRefUrl = null, refWhat = [], campaignVision = '', shot = '' }) {
+  const refs = [];
+  if (modelUrl) refs.push(modelUrl);
+  refs.push(...garmentUrls);
+  if (sceneRefUrl) refs.push(sceneRefUrl);
+
+  let p = '';
+  if (modelUrl) p += 'Use the SAME exact person in the first reference image. Preserve their face, body, skin tone, hair and identity. ';
+  else p += `Create a realistic candid photo of ${modelDesc || 'a real person'} `;
+  p += 'Dress the person in EXACTLY the garment shown in the product reference image(s). Preserve the garment cut, sleeve length, fit, fabric texture, all logos, all printed words, color placement, tags, labels and patches. ';
+  if (desc) p += `Product description, treat as ground truth: ${desc}. `;
+  if (sceneRefUrl) {
+    const wantPose = !refWhat.length || refWhat.includes('pose');
+    const wantBg = !refWhat.length || refWhat.includes('background');
+    p += 'The final reference is a scene/pose reference — ';
+    if (wantPose && wantBg) p += 'copy its pose, camera angle, background, location and lighting. ';
+    else if (wantPose) p += 'copy its pose and camera angle but ignore the background. ';
+    else if (wantBg) p += 'copy its background/location/lighting but vary the pose naturally. ';
+  } else {
+    if (pose) p += `Pose: ${pose}. `;
+    if (sceneText) p += `Setting: ${sceneText}. `;
+  }
+  if (styleText) p += `Photographic style: ${styleText}. `;
+  if (campaignVision) p += `Campaign vision: ${campaignVision}. `;
+  if (shot) p += `Shot type: ${shot}. `;
+  if (edits) p += `${edits}. `;
+  p += 'Make it look like a real unremarkable phone photo, not AI: natural imperfect skin, visible pores, slight sensor noise, flat soft real-world light, muted natural color, no plastic skin, no glossy render, no distorted hands, no warped text.';
+
+  const j = await falPost(FAL_NANO, {
+    prompt: p,
+    image_urls: refs,
+    aspect_ratio: '3:4',
+    resolution: '2K',
+    output_format: 'png',
+    safety_tolerance: '5',
+    num_images: 1,
+    ...(seed != null ? { seed } : {}),
+  });
+  return firstImageUrl(j);
+}
+
+async function ideogramTextPolish(imageUrl, { desc = '', styleText = '', campaignVision = '', shot = '' } = {}) {
+  let p = 'Improve this fashion campaign photo while staying very close to the input image. Keep the same person, same pose, same composition, and SAME garment. ' +
+    'CRITICAL: make all garment typography, logos, print, patches and labels clean, sharp, legible, and exactly spelled as in the input/reference. Do not invent new words. Preserve realistic fabric and natural skin. ';
+  if (desc) p += `Known product text/details: ${desc}. `;
+  if (styleText) p += `Keep this style: ${styleText}. `;
+  if (campaignVision) p += `Campaign vision: ${campaignVision}. `;
+  if (shot) p += `Shot type: ${shot}. `;
+  const j = await falPost(FAL_IDEO4, {
+    prompt: p,
+    image_url: imageUrl,
+    rendering_speed: 'QUALITY',
+    expansion_model: 'Large',
+    image_size: 'auto',
+    output_format: 'png',
+    strength: 0.28,
+    num_images: 1,
+  });
+  return firstImageUrl(j) || imageUrl;
+}
+
+async function productShot(productUrl, { desc = '', sceneText = '', styleText = '', campaignVision = '', shot = '' } = {}) {
+  let p = 'Create a realistic e-commerce/lifestyle product photo using the single clothing item in the reference image. ' +
+    'Show ONLY that one provided product as the hero item; do not add extra shirts, jackets, accessories, duplicate garments, fake logos, or unrelated products. ' +
+    'Preserve the exact garment shape, fabric texture, color, printed words, logo patch, and all visible design details. ';
+  if (desc) p += `Product details, treat as ground truth: ${desc}. `;
+  p += `Scene: ${campaignVision || sceneText || 'clean urban streetwear product photography on a concrete floor with soft natural light'}. `;
+  if (styleText) p += `Style: ${styleText}. `;
+  if (shot) p += `Shot: ${shot}. `;
+  p += 'Make it look like a real product photo, natural shadows, no AI distortions, no extra garments, no model unless explicitly requested.';
+  const j = await falPost(FAL_FLUX2, {
+    prompt: p,
+    image_urls: [productUrl],
+    image_size: 'portrait_4_3',
+    output_format: 'png',
+    safety_tolerance: '5',
+  });
+  return firstImageUrl(j);
 }
 
 async function tryOn(modelUrl, garmentUrl, category = 'auto', garmentType = 'flat-lay') {
@@ -315,7 +417,15 @@ function toDataUri(filePath, mime) {
 }
 
 // ---- health ----
-app.get('/api/health', (req, res) => res.json({ status: 'ok', fal: !!FAL_KEY, pipeline: 'flux2-garment-v9' }));
+app.get('/api/health', (req, res) => res.json({
+  status: 'ok', fal: !!FAL_KEY, pipeline: 'multi-engine-v10',
+  modes: {
+    standard: { label: 'Standard', cost: modeCost('standard'), engine: 'FLUX.2 Pro + Clarity' },
+    premium: { label: 'Premium Realism', cost: modeCost('premium'), engine: 'Nano Banana Pro + Clarity' },
+    logo: { label: 'Logo/Text Lock', cost: modeCost('logo'), engine: 'FLUX.2 Pro + Ideogram 4 Quality' },
+    product: { label: 'Product Shot', cost: modeCost('product'), engine: 'FLUX.2 Pro product edit' },
+  }
+}));
 app.get('/api/styles', (req, res) => res.json({ styles: Object.keys(STYLES), scenes: Object.keys(SCENES), recipes: STYLES }));
 
 // ---- TEST shot: real garment photo(s) + model options -> ONE faithful campaign shot ----
@@ -351,25 +461,56 @@ app.post('/api/test-photo', requireAppKey, genLimiter, upload.fields([{ name: 'p
       files.push(req.files.modelImg[0].path);
     }
 
-    const rawUrl = await flux2Garment({
-      garmentUrls,
-      desc: opts.productDesc || '',
-      modelDesc: modelDescription(opts.model),
-      modelUrl,
-      sceneText,
-      styleText,
-      pose: opts.pose || '',
-      edits: opts.edits || '',
-      seed: opts.model && opts.model.seed,
-      sceneRefUrl,
-      refWhat: opts.refWhat || [],
-    });
-    if (!rawUrl) throw new Error('garment render failed');
+    const mode = outputMode(opts);
+    let rawUrl = null;
+    let url = null;
 
-    // forced upscale -> crisp real texture (identity-safe, won't melt the face)
-    const url = await upscale(rawUrl);
+    if (mode === 'product') {
+      rawUrl = await productShot(garmentUrls[0], {
+        desc: opts.productDesc || '',
+        sceneText,
+        styleText,
+        campaignVision: opts.campaignVision || '',
+        shot: opts.pose || 'premium e-commerce lifestyle product shot',
+      });
+      if (!rawUrl) throw new Error('product shot failed');
+      url = rawUrl; // Bria returns final product photography; no face/identity upscale needed.
+    } else if (mode === 'premium') {
+      rawUrl = await nanoGarment({
+        garmentUrls,
+        desc: opts.productDesc || '',
+        modelDesc: modelDescription(opts.model),
+        modelUrl,
+        sceneText,
+        styleText,
+        pose: opts.pose || '',
+        edits: opts.edits || '',
+        seed: opts.model && opts.model.seed,
+        sceneRefUrl,
+        refWhat: opts.refWhat || [],
+      });
+      if (!rawUrl) throw new Error('premium realism render failed');
+      url = await upscale(rawUrl);
+    } else {
+      rawUrl = await flux2Garment({
+        garmentUrls,
+        desc: opts.productDesc || '',
+        modelDesc: modelDescription(opts.model),
+        modelUrl,
+        sceneText,
+        styleText,
+        pose: opts.pose || '',
+        edits: opts.edits || '',
+        seed: opts.model && opts.model.seed,
+        sceneRefUrl,
+        refWhat: opts.refWhat || [],
+      });
+      if (!rawUrl) throw new Error('garment render failed');
+      if (mode === 'logo') rawUrl = await ideogramTextPolish(rawUrl, { desc: opts.productDesc || '', styleText });
+      url = await upscale(rawUrl);
+    }
 
-    res.json({ success: true, image: url, raw: rawUrl });
+    res.json({ success: true, image: url, raw: rawUrl, mode, estimated_cost: modeCost(mode) });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   } finally {
@@ -404,6 +545,8 @@ app.post('/api/campaign', requireAppKey, genLimiter, upload.fields([{ name: 'pro
     const sceneText = opts.scene && SCENES[opts.scene] ? SCENES[opts.scene] : '';
     const styleText = [(opts.styles || []).map(s => STYLES[s]).filter(Boolean).join('; '), (opts.customStyle || '').trim()].filter(Boolean).join('; ');
 
+    const mode = outputMode(opts);
+
     const shots = [
       'wide full-body shot, full figure head to toe',
       'candid mid-action moment, natural movement',
@@ -416,42 +559,69 @@ app.post('/api/campaign', requireAppKey, genLimiter, upload.fields([{ name: 'pro
     const errors = [];
     for (const shot of shots) {
       try {
-        // refs: approved test photo FIRST (locks identity + the already-correct garment),
-        // then the raw product photos (reinforce garment fidelity each shot), then scene ref.
-        const refs = [approvedUrl, ...garmentUrls];
-        if (sceneRefUrl) refs.push(sceneRefUrl);
-        let p = 'Use the SAME exact person shown in the FIRST reference image — same face, same ' +
-          'facial features, same skin tone, same hairstyle, same body. Keep their identity perfectly ' +
-          'consistent. Keep them wearing EXACTLY the same garment shown in the reference images — ' +
-          'reproduce the cut, sleeve length, fabric texture, every printed graphic, all text with the ' +
-          'same wording/fonts/colors, and every label/patch faithfully and legibly. ';
-        if (sceneRefUrl) p += 'Use the SAME background, location and lighting as shown in the FINAL reference image. ';
-        else if (sceneText) p += `Setting: ${sceneText}. `;
-        if (styleText) p += `Photographic style: ${styleText}. `;
-        if (opts.campaignVision) p += `Campaign vision: ${opts.campaignVision}. `;
-        if (opts.edits) p += `${opts.edits}. `;
-        p += `Shot: ${shot}, consistent with the campaign theme. ` +
-          'Authentic imperfect real human skin with visible pores and natural texture, NOT airbrushed, ' +
-          'NOT plastic, sharp in-focus face. Natural realistic fabric drape. Semi-iPhone photo quality, ' +
-          'soft natural light, slight real-camera grain, looks like a real photograph.';
+        let rawUrl = null;
+        if (mode === 'product') {
+          rawUrl = await productShot(garmentUrls[0], {
+            desc: opts.productDesc || '',
+            sceneText,
+            styleText,
+            campaignVision: opts.campaignVision || '',
+            shot,
+          });
+        } else if (mode === 'premium') {
+          rawUrl = await nanoGarment({
+            garmentUrls,
+            desc: opts.productDesc || '',
+            modelDesc: modelDescription(opts.model),
+            modelUrl: approvedUrl,
+            sceneText,
+            styleText,
+            pose: '',
+            edits: opts.edits || '',
+            sceneRefUrl,
+            refWhat: sceneRefUrl ? ['background'] : [],
+            campaignVision: opts.campaignVision || '',
+            shot,
+          });
+        } else {
+          // refs: approved test photo FIRST (locks identity + the already-correct garment),
+          // then the raw product photos (reinforce garment fidelity each shot), then scene ref.
+          const refs = [approvedUrl, ...garmentUrls];
+          if (sceneRefUrl) refs.push(sceneRefUrl);
+          let p = 'Use the SAME exact person shown in the FIRST reference image — same face, same ' +
+            'facial features, same skin tone, same hairstyle, same body. Keep their identity perfectly ' +
+            'consistent. Keep them wearing EXACTLY the same garment shown in the reference images — ' +
+            'reproduce the cut, sleeve length, fabric texture, every printed graphic, all text with the ' +
+            'same wording/fonts/colors, and every label/patch faithfully and legibly. ';
+          if (sceneRefUrl) p += 'Use the SAME background, location and lighting as shown in the FINAL reference image. ';
+          else if (sceneText) p += `Setting: ${sceneText}. `;
+          if (styleText) p += `Photographic style: ${styleText}. `;
+          if (opts.campaignVision) p += `Campaign vision: ${opts.campaignVision}. `;
+          if (opts.edits) p += `${opts.edits}. `;
+          p += `Shot: ${shot}, consistent with the campaign theme. ` +
+            'Authentic imperfect real human skin with visible pores and natural texture, NOT airbrushed, ' +
+            'NOT plastic, sharp in-focus face. Natural realistic fabric drape. Semi-iPhone photo quality, ' +
+            'soft natural light, slight real-camera grain, looks like a real photograph.';
 
-        const rawUrl = await falPost(FAL_FLUX2, {
-          prompt: p,
-          image_urls: refs,
-          image_size: 'portrait_4_3',
-          output_format: 'png',
-          safety_tolerance: '5',
-        }).then(j => (j.images || [])[0]?.url);
+          rawUrl = await falPost(FAL_FLUX2, {
+            prompt: p,
+            image_urls: refs,
+            image_size: 'portrait_4_3',
+            output_format: 'png',
+            safety_tolerance: '5',
+          }).then(firstImageUrl);
+          if (mode === 'logo' && rawUrl) rawUrl = await ideogramTextPolish(rawUrl, { desc: opts.productDesc || '', styleText, campaignVision: opts.campaignVision || '', shot });
+        }
         if (!rawUrl) { errors.push(`${shot}: render failed`); continue; }
 
-        const url = await upscale(rawUrl);
+        const url = mode === 'product' ? rawUrl : await upscale(rawUrl);
         out.push(url);
       } catch (e) {
         errors.push(`${shot}: ${String(e.message || e)}`);
       }
     }
     if (!out.length) throw new Error(errors.join(' | ') || 'campaign produced no images');
-    res.json({ success: true, images: out, ...(errors.length ? { warnings: errors } : {}) });
+    res.json({ success: true, images: out, mode, estimated_cost: modeCost(mode), ...(errors.length ? { warnings: errors } : {}) });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   } finally {
@@ -486,4 +656,4 @@ app.post('/api/upscale', requireAppKey, genLimiter, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY}) pipeline=flux2-garment-v9`));
+app.listen(PORT, () => console.log(`ThreadGen backend on :${PORT} (fal=${!!FAL_KEY}) pipeline=multi-engine-v10`));
