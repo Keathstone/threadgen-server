@@ -29,8 +29,9 @@ loadEnv();
 const FAL_KEY = process.env.FAL_KEY;
 // Shared-secret app key: the frontend sends this on every request so randoms who find the
 // public API URL can't burn our FAL credits. Not a real user-auth system — just a lock on
-// a public endpoint. Set THREADGEN_APP_KEY in Render env vars + the frontend's localStorage.
-const APP_KEY = process.env.THREADGEN_APP_KEY || null;
+// a public endpoint. Prefer THREADGEN_APP_KEY in Render env vars; fall back to the current
+// frontend key so production stays protected even if the Render env var is missing.
+const APP_KEY = process.env.THREADGEN_APP_KEY || 'dressd-arl-2026';
 
 // ---- FAL endpoints ----
 const FAL_GEN     = 'https://fal.run/fal-ai/flux/dev';                     // text -> image (brand model, real skin)
@@ -418,7 +419,7 @@ function toDataUri(filePath, mime) {
 
 // ---- health ----
 app.get('/api/health', (req, res) => res.json({
-  status: 'ok', fal: !!FAL_KEY, pipeline: 'multi-engine-v10',
+  status: 'ok', fal: !!FAL_KEY, auth: !!APP_KEY, pipeline: 'multi-engine-v10-authfix',
   modes: {
     standard: { label: 'Standard', cost: modeCost('standard'), engine: 'FLUX.2 Pro + Clarity' },
     premium: { label: 'Premium Realism', cost: modeCost('premium'), engine: 'Nano Banana Pro + Clarity' },
