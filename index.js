@@ -48,6 +48,9 @@ const FAL_TRYON   = 'https://fal.run/fal-ai/fashn/tryon/v1.6';             // le
 const FAL_UPSCALE = 'https://fal.run/fal-ai/clarity-upscaler';            // detail + real texture
 
 const app = express();
+// Render and Cloudflare tunnel both sit behind a reverse proxy. This lets express-rate-limit
+// read the real client IP from X-Forwarded-For without throwing validation warnings.
+app.set('trust proxy', 1);
 
 // ---- CORS: lock to GitHub Pages origin (+ localhost for dev) ----
 const ALLOWED = [
